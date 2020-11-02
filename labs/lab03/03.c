@@ -19,15 +19,21 @@ typedef struct thread_args
 	size_t count;
 } thread_args_t;
 
+pthread_mutex_t sum_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 void* thread_start(void* arg) 
 {	
 	thread_args_t* args = (thread_args_t*) arg;
 	int* numbers = args->numbers;
 	size_t count = args->count;
-
+	int local_sum = 0;
 	while(count--) {
-		sum += *numbers++;	
+		local_sum += *numbers++;	
 	}
+	
+	pthread_mutex_lock(&sum_mutex);
+	sum += local_sum;
+	pthread_mutex_unlock(&sum_mutex);
 	return NULL;
 }
 
