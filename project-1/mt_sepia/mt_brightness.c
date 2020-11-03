@@ -1,262 +1,265 @@
 #include "bmp.h"
 #include "threadpool.h"
-
+ 
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-
+ 
 #if !defined C_IMPLEMENTATION && \
     !defined SIMD_INTRINSICS_IMPLEMENTATION && \
     !defined SIMD_ASM_IMPLEMENTATION
 #define C_IMPLEMENTATION 1
 #endif
-
+ 
 #ifndef C_IMPLEMENTATION
 #include <immintrin.h>
 #endif
+ 
+//static float brightness;
+//static float contrast;
 
-typedef struct _filters_sepia_data
+typedef struct _brightness_data
 {
-    uint8_t *pixels;
+    uint8_t* pixels;
+    float brightness;
+    float contrast;
     size_t position;
     size_t channels_to_process;
     volatile ssize_t *channels_left;
-    volatile bool *barrier_sense;
-} filters_sepia_data_t;
+    volatile bool *exit;
 
-static void sepia_processing_task(
-                void *task_data,
-                void (*result_callback)(void *result) __attribute__((unused))
-            )
+} brightness_data_t;
+ 
+typedef void (*result_callback_t)(void*);
+#define attr_unused __attribute__((unused))
+
+static void brightness_processing_task(void* task_data, result_callback_t res_callback attr_unused)
 {
-    filters_sepia_data_t *data = task_data;
-
-    uint8_t *pixels = data->pixels;
+    brightness_data_t* data = task_data;
+ 
+    uint8_t* pixels = data->pixels;
     size_t position = data->position;
     size_t channels_to_process = data->channels_to_process;
     size_t end = position + channels_to_process;
+    float brightness = data->brightness;
+    float contrast = data->contrast;
 #if defined SIMD_INTRINSICS_IMPLEMENTATION || defined SIMD_ASM_IMPLEMENTATION
     size_t step = 16;
 #else
     size_t step = 4;
 #endif
-
+ 
     for (; position < end; position += step) {
 #if defined C_IMPLEMENTATION
-
-        static const float Sepia_Coefficients[] = {
-            0.272f, 0.534f, 0.131f,
-            0.349f, 0.686f, 0.168f,
-            0.393f, 0.769f, 0.189f
-        };
-
-        uint32_t blue =
-            pixels[position];
-        uint32_t green =
-            pixels[position + 1];
-        uint32_t red =
-            pixels[position + 2];
-
+ 
         pixels[position] =
-            (uint8_t) UTILS_MIN(
-                          Sepia_Coefficients[0] * blue  +
-                          Sepia_Coefficients[1] * green +
-                          Sepia_Coefficients[2] * red,
-                          255.0f
-                      );
+            (uint8_t) UTILS_CLAMP(pixels[position] * contrast + brightness, 0.0f, 255.0f);
         pixels[position + 1] =
-            (uint8_t) UTILS_MIN(
-                          Sepia_Coefficients[3] * blue  +
-                          Sepia_Coefficients[4] * green +
-                          Sepia_Coefficients[5] * red,
-                          255.0f
-                      );
+            (uint8_t) UTILS_CLAMP(pixels[position + 1] * contrast + brightness, 0.0f, 255.0f);
         pixels[position + 2] =
-            (uint8_t) UTILS_MIN(
-                          Sepia_Coefficients[6] * blue  +
-                          Sepia_Coefficients[7] * green +
-                          Sepia_Coefficients[8] * red,
-                          255.0f
-                      );
-
+            (uint8_t) UTILS_CLAMP(pixels[position + 2] * contrast + brightness, 0.0f, 255.0f);
+ 
 #elif defined SIMD_INTRINSICS_IMPLEMENTATION
+ 
 
-        static const float Sepia_Coefficients[] __attribute__((aligned(0x40))) = {
-            0.272f, 0.349f, 0.393f, 1.0f, 0.272f, 0.349f, 0.393f, 1.0f, 0.272f, 0.349f, 0.393f, 1.0f, 0.272f, 0.349f, 0.393f, 1.0f,
-            0.534f, 0.686f, 0.769f, 1.0f, 0.534f, 0.686f, 0.769f, 1.0f, 0.534f, 0.686f, 0.769f, 1.0f, 0.534f, 0.686f, 0.769f, 1.0f,
-            0.131f, 0.168f, 0.189f, 1.0f, 0.131f, 0.168f, 0.189f, 1.0f, 0.131f, 0.168f, 0.189f, 1.0f, 0.131f, 0.168f, 0.189f, 1.0f
-        };
+            // TODO
+		// broadcast 32-bit sp float into zmm
+		__m512 zmm_brightness = _mm512_set1_ps(brightness);
 
-        __m512 coeff1 = _mm512_load_ps(&Sepia_Coefficients[0]);
-        __m512 coeff2 = _mm512_load_ps(&Sepia_Coefficients[16]);
-        __m512 coeff3 = _mm512_load_ps(&Sepia_Coefficients[32]);
-        __m512i ints = _mm512_cvtepu8_epi32(_mm_load_si128((__m128i *) &pixels[position]));
-        __m512 floats = _mm512_cvtepi32_ps(ints);
-        __m512 temp1 = floats;
-        __m512 temp2 = floats;
-        __m512 temp3 = floats;
-        temp1 = _mm512_permute_ps(temp1, 0b11000000);
-        temp2 = _mm512_permute_ps(temp2, 0b11010101);
-        temp3 = _mm512_permute_ps(temp3, 0b11101010);
-        floats = _mm512_mul_ps(coeff1, temp1);
-        floats = _mm512_fmadd_ps(coeff2, temp2, floats);
-        floats = _mm512_fmadd_ps(coeff3, temp3, floats);
-        ints = _mm512_cvtps_epi32(floats);
-        _mm512_mask_cvtusepi32_storeu_epi8(&pixels[position], 0xffff, ints);
+		// broadcast contrast to zmm
+		__m512 zmm_contrast   = _mm512_set1_ps(contrast);
+
+		// load 16 8-bit unsigned integers from memory
+		void const* pixels_addr = pixels + position;
+		// for some reason gcc cant find _mm_loadu_epi8(pixels_addr);
+		__m128i xmmi_16pixels  = _mm_load_si128( (__m128i*) pixels_addr);
+
+		// zero extend these 16 8-bit unsigned integers into 16 32-bit signed integers
+		__m512i zmmi_16pixels = _mm512_cvtepu8_epi32(xmmi_16pixels);
+
+		// convert 16 32-bit signed integers into 16 32-bit floats
+		__m512 zmm_16pixels = _mm512_cvtepi32_ps(zmmi_16pixels);
+
+		// mult and add
+		__m512 zmm_result = _mm512_fmadd_ps(zmm_16pixels, zmm_contrast, zmm_brightness);
+
+		// convert 16 32-bit floats into 16 32-bit integers
+		__m512i zmmi_result = _mm512_cvtps_epi32(zmm_result);
+
+		// create less or equal mask for 16 32-bit integers
+		//__m512i zmmi_number_255 = _mm512_set1_epi32(255);
+		//__mmask16 mask_le_255 = _mm512_cmple_epi32_mask(zmmi_result, zmmi_number_255);	
+
+		// clump below 255
+		//__m512i zmmi_res_clump_up = _mm512_mask_blend_epi32(mask_le_255, zmmi_number_255, zmmi_result);
+
+		// create greater or equal mask
+		//__m512i zmmi_number_0 = _mm512_set1_epi32(0);
+		//__mmask16 mask_ge_0 = _mm512_cmpge_epi32_mask(zmmi_res_clump_up, zmmi_number_0);
+
+		// clump above 0
+		//__m512i zmmi_res_clumped = _mm512_mask_blend_epi32(mask_ge_0, zmmi_number_0, zmmi_res_clump_up);
+	
+		// load back to memory. Did not knew about saturation that is why implemented clumping
+		__m128i xmmi_result = _mm512_cvtusepi32_epi8(zmmi_result);	
+		_mm_store_si128( (void*) pixels_addr, xmmi_result); 
 
 #elif defined SIMD_ASM_IMPLEMENTATION
-
-	__asm__ __volatile__ (
-		"vmovups (%0), %%zmm1\n\t"			// coef1 = zmm1
-		"vmovups 64(%0), %%zmm2\n\t"			// coef2 = zmm2
-		"vmovups 128(%0), %%zmm3\n\t"			// coef3 = zmm3
-		"vpmovzxbd (%3,%4), %%zmm0\n\t"			// ints  = zmm0
-		"vcvtdq2ps %%zmm0, %%zmm0\n\t"			// floats = zmm0
-		"vpermilps $0b11000000, %%zmm0, %%zmm4\n\t"	// temp1 = zmm4
-		"vpermilps $0b11010101, %%zmm0, %%zmm5\n\t"	// temp2 = zmm5
-		"vpermilps $0b11101010, %%zmm0, %%zmm6\n\t"	// temp3 = zmm6
-		"vmulps %%zmm4, %%zmm1, %%zmm0\n\t"
-		"vfmadd132ps %%zmm5, %%zmm0, %%zmm2\n\t"	
-		"vfmadd132ps %%zmm6, %%zmm2, %%zmm3\n\t"
-		"vcvtps2dq %%zmm3, %%zmm3\n\t"
-                "vpmovusdb %%zmm3, (%3,%4)\n\t"
-            ::
-                "S"(coeffs), "D"(coeffs+16), "b"(coeffs+32), "c"(pixels), "d"(position)
-            :
-                 /*floats*/ "%zmm0", /*coefs*/ "%zmm1", "%zmm2","%zmm3", /*temps*/ "%zmm4", "%zmm5", "%zmm6"
-            );
-
+ 
+        __asm__ __volatile__ (
+            "vbroadcastss (%0), %%zmm2\n\t"
+            "vbroadcastss (%1), %%zmm1\n\t"
+            "vpmovzxbd (%2,%3), %%zmm0\n\t"
+            "vcvtdq2ps %%zmm0, %%zmm0\n\t"
+            "vfmadd132ps %%zmm1, %%zmm2, %%zmm0\n\t"
+            "vcvtps2dq %%zmm0, %%zmm0\n\t"
+            "vpmovusdb %%zmm0, (%2,%3)\n\t"
+        ::
+            "S"(&brightness), "D"(&contrast), "b"(pixels), "c"(position)
+        :
+            "%zmm0", "%zmm1", "%zmm2"
+        );
+ 
 #endif
     }
-
+ 
     ssize_t channels_left = __sync_sub_and_fetch(data->channels_left, (ssize_t) channels_to_process);
     if (channels_left <= 0) {
-        __sync_lock_test_and_set(data->barrier_sense, true);
+        __sync_lock_test_and_set(data->exit, true);
     }
-
+ 
     free(data);
     data = NULL;
 }
-
-int main(int argc, char *argv[])
+ 
+int main(int argc, char* argv[])
 {
     int result = EXIT_FAILURE;
-
+ 
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s <source file> <dest. file>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <brightness> <contrast> <source file> <dest. file>\n", argv[0]);
         return result;
     }
-
-    char *source_file_name = argv[1];
-    char *destination_file_name = argv[2];
+ 
+    float brightness = strtof(argv[1], NULL);
+    float contrast = strtof(argv[2], NULL);
+ 
+    char *source_file_name = argv[3];
+    char *destination_file_name = argv[4];
     FILE *source_descriptor = NULL;
     FILE *destination_descriptor = NULL;
-
+ 
     bmp_image image; bmp_init_image_structure(&image);
-
+ 
     source_descriptor = fopen(source_file_name, "r");
     if (source_descriptor == NULL) {
-        perror(NULL);
         fprintf(stderr, "Failed to open the source image file '%s'\n", source_file_name);
         goto cleanup;
     }
-
+ 
     const char *error_message;
     bmp_open_image_headers(source_descriptor, &image, &error_message);
     if (error_message != NULL) {
         fprintf(stderr, "Failed to process the image '%s':\n\t%s\n", source_file_name, error_message);
         goto cleanup;
     }
-
+ 
     bmp_read_image_data(source_descriptor, &image, &error_message);
     if (error_message != NULL) {
         fprintf(stderr, "Failed to process the image '%s':\n\t%s\n", source_file_name, error_message);
         goto cleanup;
     }
-
+ 
     destination_descriptor = fopen(destination_file_name, "w");
     if (destination_descriptor == NULL) {
         fprintf(stderr, "Failed to create the output image '%s'\n", destination_file_name);
         goto cleanup;
     }
-
+ 
     bmp_write_image_headers(destination_descriptor, &image, &error_message);
     if (error_message != NULL) {
         fprintf(stderr, "Failed to process the image '%s':\n\t%s\n", destination_file_name, error_message);
         goto cleanup;
     }
-
+ 
     size_t pool_size = utils_get_number_of_cpu_cores();
     threadpool_t *threadpool = threadpool_create(pool_size);
     if (threadpool == NULL) {
         fputs("Failed to create a threadpool.\n", stderr);
         goto cleanup;
     }
-
+ 
     /* Main Image Processing Loop */
     {
         static volatile ssize_t channels_left = 0;
-        static volatile bool barrier_sense = false;
-
+        static volatile bool exit = false;
+ 
         uint8_t *pixels = image.pixels;
-
+ 
         size_t width = image.absolute_image_width;
         size_t height = image.absolute_image_height;
-
+ 
         size_t channels_count = width * height * 4;
         channels_left = channels_count;
         size_t channels_per_thread = channels_count / pool_size;
-
+ 
 #if defined SIMD_INTRINSICS_IMPLEMENTATION || defined SIMD_ASM_IMPLEMENTATION
         channels_per_thread = ((channels_per_thread - 1) / 16 + 1) * 16;
 #else
         channels_per_thread = ((channels_per_thread - 1) / 4 + 1) * 4;
 #endif
-
+ 
         for (size_t position = 0; position < channels_count; position += channels_per_thread) {
-            filters_sepia_data_t *task_data = malloc(sizeof(*task_data));
+            brightness_data_t* task_data = malloc(sizeof(*task_data));
             if (task_data == NULL) {
                 fputs("Out of memory.\n", stderr);
                 goto cleanup;
             }
-
+ 
             task_data->pixels = pixels;
             task_data->position = position;
-
+ 
             task_data->channels_to_process =
                 position + channels_per_thread > channels_count ?
                     channels_count - position :
                     channels_per_thread;
+
             task_data->channels_left = &channels_left;
-            task_data->barrier_sense = &barrier_sense;
-
-            threadpool_enqueue_task(threadpool, sepia_processing_task, task_data, NULL);
+            task_data->exit = &exit;
+ 
+            task_data->brightness = brightness;
+            task_data->contrast = contrast;
+ 
+            threadpool_enqueue_task(threadpool, brightness_processing_task, task_data, NULL);
         }
-
-        while (!barrier_sense) { }
+ 
+        while (!exit) { }
     }
-
+ 
     bmp_write_image_data(destination_descriptor, &image, &error_message);
     if (error_message != NULL) {
         fprintf(stderr, "Failed to process the image '%s':\n\t%s\n", destination_file_name, error_message);
         goto cleanup;
     }
-
+ 
     result = EXIT_SUCCESS;
-
+ 
 cleanup:
     bmp_free_image_structure(&image);
-
+ 
     if (source_descriptor != NULL) {
         fclose(source_descriptor);
         source_descriptor = NULL;
     }
-
+ 
     if (destination_descriptor != NULL) {
         fclose(destination_descriptor);
         destination_descriptor = NULL;
     }
-
+ 
     return result;
 }
+#ifdef attr_unused
+#undef attr_unused
+#endif//attr_unused
