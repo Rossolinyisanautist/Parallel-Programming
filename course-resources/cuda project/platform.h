@@ -6,7 +6,7 @@
 #include "device_launch_parameters.h"
 
 #define dev_size_t int
-#define dev_image_channel_t int
+#define dev_image_channel_t float
 
 #define PRIds "d"
 #define PRIic "d"
