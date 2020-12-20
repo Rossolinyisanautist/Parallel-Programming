@@ -1,0 +1,4 @@
+*.txt
+*.exe
+nbody
+nbody-mpi
